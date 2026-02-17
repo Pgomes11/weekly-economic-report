@@ -8,12 +8,20 @@ import time
 from io import BytesIO
 
 import requests
-from bs4 import BeautifulSoup
+import feedparser
 
 from openai import OpenAI
 
 # PDF (ReportLab)
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem, Table, TableStyle
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    ListFlowable,
+    ListItem,
+    Table,
+    TableStyle,
+)
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
@@ -22,114 +30,164 @@ from reportlab.lib import colors
 app = Flask(__name__)
 STORAGE_FILE = "reports.json"
 
-# OpenAI client (uses OPENAI_API_KEY env var)
+# OpenAI client (reads OPENAI_API_KEY from env)
 client = OpenAI()
 
 
-def get_sources():
+# ---------------------------
+# Config helpers
+# ---------------------------
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+
+def now_week() -> str:
+    return datetime.now().strftime("%Y-W%W")
+
+
+def news_query() -> str:
+    # Puedes cambiarlo en Render con NEWS_QUERY
+    return os.getenv(
+        "NEWS_QUERY",
+        "mercado inmobiliario Madrid precios vivienda Idealista informe",
+    ).strip()
+
+
+def news_language() -> str:
+    # hl: interfaz; ceid: edición, para España
+    return os.getenv("NEWS_LANG", "es").strip()
+
+
+def news_country() -> str:
+    return os.getenv("NEWS_COUNTRY", "ES").strip()
+
+
+def max_news_items() -> int:
+    return env_int("NEWS_MAX_ITEMS", 10)
+
+
+def openai_model() -> str:
+    # Pon OPENAI_MODEL en Render si quieres cambiarlo
+    return os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+
+
+# ---------------------------
+# News fetching (RSS)
+# ---------------------------
+def build_google_news_rss_url(query: str, lang: str = "es", country: str = "ES") -> str:
+    # Ejemplo: https://news.google.com/rss/search?q=...&hl=es&gl=ES&ceid=ES:es
+    ceid = f"{country}:{lang}"
+    return (
+        "https://news.google.com/rss/search?q="
+        + requests.utils.quote(query)
+        + f"&hl={lang}&gl={country}&ceid={ceid}"
+    )
+
+
+def fetch_news_items(query: str, max_items: int = 10, lang: str = "es", country: str = "ES") -> list[dict]:
     """
-    Comma-separated URLs in REPORT_SOURCES env var.
-    Falls back to the user-provided Idealista URL.
+    Devuelve una lista de items:
+    [{title, url, published, source, snippet}]
     """
-    default_url = "https://www.idealista.com/sala-de-prensa/informes-precio-vivienda/venta/madrid-comunidad/madrid-provincia/madrid/"
-    raw = os.getenv("REPORT_SOURCES", default_url).strip()
-    urls = [u.strip() for u in raw.split(",") if u.strip()]
-    return urls[:8]  # keep it sane
+    rss_url = build_google_news_rss_url(query, lang=lang, country=country)
+    feed = feedparser.parse(rss_url)
 
+    items = []
+    for entry in feed.entries[: max_items]:
+        title = getattr(entry, "title", "") or ""
+        url = getattr(entry, "link", "") or ""
+        published = getattr(entry, "published", "") or ""
+        source = ""
+        if hasattr(entry, "source") and isinstance(entry.source, dict):
+            source = entry.source.get("title", "") or ""
 
-def fetch_url_text(url: str, max_chars: int = 14000) -> dict:
-    """
-    Fetch a web page and extract readable text.
-    Returns: {url, title, text}
-    """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; WeeklyEconomicReport/1.0; +https://onrender.com)"
-    }
-    r = requests.get(url, headers=headers, timeout=20)
-    r.raise_for_status()
+        # snippet: Google News RSS suele meter summary/description con HTML
+        snippet = ""
+        if hasattr(entry, "summary"):
+            snippet = entry.summary or ""
+        elif hasattr(entry, "description"):
+            snippet = entry.description or ""
 
-    soup = BeautifulSoup(r.text, "html.parser")
+        # Limpieza muy simple de tags HTML
+        snippet = snippet.replace("<b>", "").replace("</b>", "")
+        snippet = snippet.replace("<br>", " ").replace("<br/>", " ")
+        snippet = " ".join(snippet.split())
 
-    # Remove noisy elements
-    for tag in soup(["script", "style", "noscript", "svg"]):
-        tag.decompose()
-
-    title = (soup.title.get_text(" ", strip=True) if soup.title else "").strip()
-
-    # Prefer main/article if exists
-    main = soup.find("main") or soup.find("article") or soup.body
-    text = main.get_text("\n", strip=True) if main else soup.get_text("\n", strip=True)
-
-    # Clean + compact lines
-    lines = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        # Drop very short junky lines
-        if len(line) < 2:
-            continue
-        lines.append(line)
-
-    cleaned = "\n".join(lines)
-    cleaned = cleaned[:max_chars]  # keep prompt size controlled
-
-    return {"url": url, "title": title[:180], "text": cleaned}
-
-
-def build_report_with_openai(pages: list, week: str) -> dict:
-    """
-    Use OpenAI to produce a structured weekly report WITHOUT copying full article text.
-    Important: summarise + extract key signals + cite URLs.
-    """
-    # Build a compact input
-    parts = []
-    for p in pages:
-        snippet = p["text"]
-        parts.append(
-            f"FUENTE: {p['url']}\nTITULO: {p['title']}\nCONTENIDO (extracto para análisis):\n{snippet}\n"
+        items.append(
+            {
+                "title": title.strip(),
+                "url": url.strip(),
+                "published": published.strip(),
+                "source": source.strip(),
+                "snippet": snippet.strip(),
+            }
         )
 
-    input_text = "\n\n---\n\n".join(parts)
+    return items
 
+
+# ---------------------------
+# OpenAI report generation
+# ---------------------------
+def build_report_with_openai(news_items: list[dict], week: str) -> dict:
+    """
+    Genera un informe original en base a titulares + snippets (no copia artículos).
+    Devuelve JSON estructurado.
+    """
+    # Compact input
+    lines = []
+    for i, it in enumerate(news_items, start=1):
+        lines.append(
+            f"{i}. TITULAR: {it.get('title','')}\n"
+            f"   FECHA: {it.get('published','')}\n"
+            f"   MEDIO: {it.get('source','')}\n"
+            f"   LINK: {it.get('url','')}\n"
+            f"   SNIPPET: {it.get('snippet','')}\n"
+        )
+    input_text = "\n".join(lines).strip()
+
+    # Nota clave: debe aparecer la palabra "json" para usar text.format json_object
     instructions = (
-        "Eres un analista económico e inmobiliario. "
-        "Con las fuentes proporcionadas, redacta un informe semanal EN ESPAÑOL, claro y accionable.\n\n"
-        "Reglas IMPORTANTES:\n"
-        "- NO copies el artículo ni pegues texto largo: como máximo frases cortas sueltas. Nada de párrafos calcados.\n"
-        "- Da un resumen propio, con números y señales clave si aparecen.\n"
-        "- Si falta un dato, dilo; no inventes.\n"
-        "- Incluye siempre una sección de 'Fuentes' con los enlaces.\n\n"
-        "Formato de salida: JSON estricto con estas claves EXACTAS:\n"
+        "IMPORTANTE: Devuelve SOLO json válido (json). No añadas texto fuera del JSON.\n\n"
+        "Eres analista del mercado inmobiliario en España. "
+        "Con la lista de noticias (titulares + snippets) redacta un INFORME SEMANAL original, claro y accionable.\n\n"
+        "Reglas:\n"
+        "- NO copies artículos ni pegues texto largo: usa solo el snippet como señal.\n"
+        "- Si un dato no está en las noticias, di que no aparece.\n"
+        "- Identifica temas recurrentes, señales de precio/ventas/oferta, sentimiento y riesgos.\n"
+        "- Incluye una sección de 'Fuentes' con enlaces (los de las noticias).\n\n"
+        "Salida EXACTA en json con esta estructura:\n"
         "{\n"
         '  "title": string,\n'
         '  "week": string,\n'
-        '  "executive_summary": [string, ...] (5-8 bullets),\n'
-        '  "sections": [{"heading": string, "bullets": [string, ...]} ...] (3-6 secciones),\n'
+        '  "executive_summary": [string, ...],\n'
+        '  "sections": [{"heading": string, "bullets": [string, ...]} ...],\n'
         '  "sources": [{"url": string, "note": string} ...],\n'
         '  "generated_at": string\n'
         "}\n"
     )
 
-    # Use Responses API (official)
     resp = client.responses.create(
-        model=os.getenv("OPENAI_MODEL", "gpt-5.2"),
+        model=openai_model(),
         instructions=instructions,
-        input=f"Semana objetivo: {week}\n\nFUENTES:\n{input_text}",
-        # Ask for JSON output
+        # metemos "(json)" también aquí para cumplir el requisito sí o sí
+        input=f"(json) Semana objetivo: {week}\n\nNOTICIAS:\n{input_text}",
         text={"format": {"type": "json_object"}},
     )
 
-    # SDK convenience property
-    raw = resp.output_text
-    data = json.loads(raw)
-
-    # Safety: ensure week & timestamp exist
+    data = json.loads(resp.output_text)
     data["week"] = data.get("week") or week
     data["generated_at"] = data.get("generated_at") or datetime.now().isoformat(timespec="seconds")
+    data["title"] = data.get("title") or "Weekly Economic Report"
     return data
 
 
+# ---------------------------
+# Persistence + generator
+# ---------------------------
 class ReportGenerator:
     def __init__(self):
         self.reports = {}
@@ -148,23 +206,34 @@ class ReportGenerator:
 
     def generate(self):
         """
-        Full pipeline:
-        - fetch sources
-        - summarize with OpenAI into a structured report
-        - persist
+        Pipeline:
+        1) Lee noticias (RSS)
+        2) Resume y estructura el informe con OpenAI
+        3) Guarda en reports.json
         """
-        week = datetime.now().strftime("%Y-W%W")
-        sources = get_sources()
+        week = now_week()
 
-        pages = []
-        for url in sources:
-            try:
-                pages.append(fetch_url_text(url))
-            except Exception as e:
-                pages.append({"url": url, "title": "", "text": f"[ERROR leyendo fuente: {e}]"})
+        items = fetch_news_items(
+            query=news_query(),
+            max_items=max_news_items(),
+            lang=news_language(),
+            country=news_country(),
+        )
 
-
-        report_struct = build_report_with_openai(pages=pages, week=week)
+        if not items:
+            # Aun así guardamos algo para no romper
+            report_struct = {
+                "title": "Weekly Economic Report",
+                "week": week,
+                "executive_summary": ["No se han podido recuperar noticias (RSS vacío o fallo de red)."],
+                "sections": [
+                    {"heading": "Estado del feed", "bullets": ["No hay items disponibles en este momento."]}
+                ],
+                "sources": [],
+                "generated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        else:
+            report_struct = build_report_with_openai(items, week=week)
 
         self.reports[week] = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -176,6 +245,9 @@ class ReportGenerator:
 gen = ReportGenerator()
 
 
+# ---------------------------
+# UI
+# ---------------------------
 @app.route("/")
 def home():
     return """
@@ -194,9 +266,6 @@ def home():
       --muted: rgba(255,255,255,0.70);
       --muted2: rgba(255,255,255,0.55);
       --border: rgba(255,255,255,0.12);
-      --accent: #7c3aed;
-      --accent2: #22c55e;
-      --danger: #ef4444;
       --shadow: 0 18px 60px rgba(0,0,0,0.45);
       --radius: 18px;
       --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
@@ -261,7 +330,7 @@ def home():
       <div class="title">
         <div class="pill">🗓️ Report semanal · <span id="now">—</span></div>
         <h1>Weekly Economic Report</h1>
-        <p>Genera el informe desde fuentes web y descárgalo en PDF.</p>
+        <p>Genera el informe desde noticias y descárgalo en PDF.</p>
       </div>
       <div class="status">
         <span class="dot" id="dot"></span>
@@ -274,7 +343,7 @@ def home():
         <div class="hd">
           <h2>Último informe</h2>
           <div class="btns">
-            <button class="primary" id="btnGen">Generar informe (web + IA)</button>
+            <button class="primary" id="btnGen">Generar informe (noticias + IA)</button>
             <button id="btnRefresh">Actualizar</button>
             <button class="success" id="btnDownload">Descargar PDF</button>
           </div>
@@ -298,10 +367,10 @@ def home():
         <div class="hd"><h2>Notas</h2></div>
         <div class="bd">
           <p class="muted">
-            El generador: (1) lee fuentes web, (2) extrae texto, (3) crea un informe original con IA, (4) lo guarda, (5) lo convierte a PDF.
+            El generador: (1) lee titulares+snippets vía RSS, (2) crea un informe original con IA, (3) lo guarda, (4) lo convierte a PDF.
           </p>
           <p class="muted">
-            Si una web bloquea bots, verás un error en la fuente (y el informe lo mencionará).
+            Configurable en Render con <span style="font-family: var(--mono);">NEWS_QUERY</span> y <span style="font-family: var(--mono);">NEWS_MAX_ITEMS</span>.
           </p>
           <div style="height: 10px"></div>
           <div class="status"><span class="dot ok"></span><span>Scheduler activo: genera a las 08:00 (server time)</span></div>
@@ -383,6 +452,9 @@ def home():
 """
 
 
+# ---------------------------
+# API
+# ---------------------------
 @app.route("/api/latest-report")
 def latest():
     if gen.reports:
@@ -400,10 +472,10 @@ def generate():
         return jsonify({"error": str(e)}), 500
 
 
-def _safe_list(flow_items):
-    if not flow_items:
+def _safe_list(items):
+    if not items:
         return []
-    return [x for x in flow_items if isinstance(x, str) and x.strip()]
+    return [x for x in items if isinstance(x, str) and x.strip()]
 
 
 @app.route("/api/download-report")
@@ -451,7 +523,6 @@ def download_report():
         story.append(bullets)
         story.append(Spacer(1, 14))
 
-    # Sections
     if isinstance(sections, list) and sections:
         for s in sections:
             heading = (s.get("heading") if isinstance(s, dict) else "") or "Sección"
@@ -471,20 +542,19 @@ def download_report():
                 story.append(Paragraph("—", styles["BodyText"]))
             story.append(Spacer(1, 12))
 
-    # Sources
     if isinstance(sources, list) and sources:
         story.append(Paragraph("Fuentes", styles["Heading2"]))
         story.append(Spacer(1, 6))
 
         rows = [["URL", "Nota"]]
-        for src in sources[:12]:
+        for src in sources[:20]:
             if not isinstance(src, dict):
                 continue
             url = src.get("url", "")
             note = src.get("note", "")
             rows.append([url, note])
 
-        table = Table(rows, colWidths=[280, 240])
+        table = Table(rows, colWidths=[290, 230])
         table.setStyle(
             TableStyle(
                 [
@@ -516,8 +586,10 @@ def download_report():
     )
 
 
+# ---------------------------
+# Scheduler
+# ---------------------------
 def run_scheduler():
-    # Generates daily at 08:00 server time
     schedule.every().day.at("08:00").do(gen.generate)
     while True:
         schedule.run_pending()
