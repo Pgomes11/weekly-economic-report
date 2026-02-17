@@ -7,6 +7,7 @@ import threading
 import time
 from io import BytesIO
 import xml.etree.ElementTree as ET
+import traceback
 
 import requests
 from openai import OpenAI
@@ -28,7 +29,6 @@ from reportlab.lib import colors
 
 app = Flask(__name__)
 STORAGE_FILE = "reports.json"
-
 client = OpenAI()
 
 
@@ -66,7 +66,7 @@ def max_news_items() -> int:
 
 
 def openai_model() -> str:
-    # Puedes definir OPENAI_MODEL en Render si quieres
+    # Si te falla el modelo, cambia esto en Render con OPENAI_MODEL
     return os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
 
@@ -82,7 +82,6 @@ def build_google_news_rss_url(query: str, lang: str = "es", country: str = "ES")
 def _clean_text(s: str) -> str:
     if not s:
         return ""
-    # Limpieza básica de HTML típico del RSS
     s = s.replace("<b>", "").replace("</b>", "")
     s = s.replace("<br>", " ").replace("<br/>", " ").replace("<br />", " ")
     s = " ".join(s.split())
@@ -92,7 +91,6 @@ def _clean_text(s: str) -> str:
 def fetch_news_items(query: str, max_items: int = 10, lang: str = "es", country: str = "ES") -> list[dict]:
     """
     Lee Google News RSS (XML) sin dependencias externas.
-    Devuelve: [{title, url, published, source, snippet}]
     """
     rss_url = build_google_news_rss_url(query, lang=lang, country=country)
     headers = {"User-Agent": "Mozilla/5.0 (compatible; WeeklyEconomicReport/1.0)"}
@@ -100,42 +98,66 @@ def fetch_news_items(query: str, max_items: int = 10, lang: str = "es", country:
     r.raise_for_status()
 
     root = ET.fromstring(r.text)
-
-    # RSS estándar: <rss><channel><item>...
     channel = root.find("channel")
     if channel is None:
         return []
 
     items = []
     for item in channel.findall("item")[:max_items]:
-        title = item.findtext("title", default="") or ""
-        link = item.findtext("link", default="") or ""
-        pub_date = item.findtext("pubDate", default="") or ""
+        title = (item.findtext("title", default="") or "").strip()
+        link = (item.findtext("link", default="") or "").strip()
+        pub_date = (item.findtext("pubDate", default="") or "").strip()
 
-        # Google News suele meter <source>... en item
         source_el = item.find("source")
         source = source_el.text.strip() if (source_el is not None and source_el.text) else ""
 
-        # description suele traer snippet con HTML
         desc = item.findtext("description", default="") or ""
         snippet = _clean_text(desc)
 
         items.append(
             {
-                "title": title.strip(),
-                "url": link.strip(),
-                "published": pub_date.strip(),
-                "source": source.strip(),
-                "snippet": snippet.strip(),
+                "title": title,
+                "url": link,
+                "published": pub_date,
+                "source": source,
+                "snippet": snippet,
             }
         )
 
     return items
 
 
+def build_fallback_report(news_items: list[dict], week: str) -> dict:
+    """
+    Si OpenAI falla, generamos un informe básico con titulares + fuentes.
+    """
+    bullets = []
+    sources = []
+    for it in news_items[:8]:
+        t = it.get("title", "")
+        s = it.get("source", "")
+        bullets.append(f"{t} ({s})")
+        if it.get("url"):
+            sources.append({"url": it["url"], "note": it.get("source", "")})
+
+    return {
+        "title": "Weekly Economic Report (fallback)",
+        "week": week,
+        "executive_summary": [
+            "No se pudo generar el informe con IA (error o timeout).",
+            "Se adjunta un resumen básico de titulares y enlaces como alternativa.",
+        ],
+        "sections": [
+            {"heading": "Titulares destacados", "bullets": bullets or ["No hay titulares disponibles."]}
+        ],
+        "sources": sources,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
 def build_report_with_openai(news_items: list[dict], week: str) -> dict:
     """
-    Informe original basado en titulares+snippets (no copia artículos).
+    Genera un informe original basado en titulares+snippets.
     """
     lines = []
     for i, it in enumerate(news_items, start=1):
@@ -153,10 +175,10 @@ def build_report_with_openai(news_items: list[dict], week: str) -> dict:
         "Eres analista del mercado inmobiliario en España. "
         "Con la lista de noticias (titulares + snippets) redacta un INFORME SEMANAL original, claro y accionable.\n\n"
         "Reglas:\n"
-        "- NO copies artículos ni pegues texto largo: usa solo el snippet como señal.\n"
+        "- NO copies artículos ni pegues texto largo: usa el snippet solo como señal.\n"
         "- Si un dato no aparece, dilo explícitamente; NO inventes.\n"
-        "- Identifica señales sobre: precios, oferta, demanda, financiación/hipotecas, regulación y sentimiento.\n"
-        "- Incluye una sección de 'Fuentes' con enlaces (los de las noticias).\n\n"
+        "- Secciones sugeridas: Precios, Demanda, Oferta/Stock, Financiación, Regulación, Riesgos.\n"
+        "- Incluye 'Fuentes' con enlaces.\n\n"
         "Salida EXACTA en json con esta estructura:\n"
         "{\n"
         '  "title": string,\n'
@@ -173,6 +195,7 @@ def build_report_with_openai(news_items: list[dict], week: str) -> dict:
         instructions=instructions,
         input=f"(json) Semana objetivo: {week}\n\nNOTICIAS:\n{input_text}",
         text={"format": {"type": "json_object"}},
+        # Si tu SDK soporta timeout, perfecto. Si no, igual tirará del timeout de requests interno.
     )
 
     data = json.loads(resp.output_text)
@@ -201,7 +224,7 @@ class ReportGenerator:
         with open(STORAGE_FILE, "w", encoding="utf-8") as f:
             json.dump(self.reports, f, ensure_ascii=False, indent=2, default=str)
 
-    def generate(self):
+    def generate(self) -> dict:
         week = now_week()
 
         items = fetch_news_items(
@@ -215,28 +238,30 @@ class ReportGenerator:
             report_struct = {
                 "title": "Weekly Economic Report",
                 "week": week,
-                "executive_summary": [
-                    "No se han podido recuperar noticias (RSS vacío o fallo de red)."
-                ],
+                "executive_summary": ["No se han podido recuperar noticias (RSS vacío o fallo de red)."],
                 "sections": [{"heading": "Estado del feed", "bullets": ["No hay items disponibles."]}],
                 "sources": [],
                 "generated_at": datetime.now().isoformat(timespec="seconds"),
             }
         else:
-            report_struct = build_report_with_openai(items, week=week)
+            try:
+                report_struct = build_report_with_openai(items, week=week)
+            except Exception:
+                report_struct = build_fallback_report(items, week=week)
 
         self.reports[week] = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "data": report_struct,
         }
         self.save()
+        return report_struct
 
 
 gen = ReportGenerator()
 
 
 # ---------------------------
-# UI
+# UI (muestra errores bien)
 # ---------------------------
 @app.route("/")
 def home():
@@ -290,15 +315,10 @@ def home():
     button{
       appearance:none; border:1px solid var(--border); background:rgba(255,255,255,0.06); color:var(--text);
       padding:10px 12px; border-radius:12px; font-weight:600; cursor:pointer;
-      transition: transform .08s ease, background .2s ease, border-color .2s ease;
     }
     button:hover{ background:rgba(255,255,255,0.10); }
-    button:active{ transform: translateY(1px); }
     .primary{ background:linear-gradient(135deg, rgba(124,58,237,0.95), rgba(59,130,246,0.85)); border-color:rgba(255,255,255,0.22); }
-    .primary:hover{ background:linear-gradient(135deg, rgba(124,58,237,1), rgba(59,130,246,0.92)); }
     .success{ background:rgba(34,197,94,0.16); border-color:rgba(34,197,94,0.35); }
-    .success:hover{ background:rgba(34,197,94,0.22); }
-    .muted{ color:var(--muted); font-size:13px; line-height:1.45; }
     .kv{ display:grid; grid-template-columns: 140px 1fr; gap:8px 12px; margin-top:10px; font-size:14px; }
     .kv div:nth-child(odd){ color:var(--muted2); }
     .kv div:nth-child(even){ font-family:var(--mono); }
@@ -306,12 +326,9 @@ def home():
          font-family:var(--mono); font-size:12.5px; color:rgba(255,255,255,0.86); overflow:auto; max-height:420px; }
     .status{ display:flex; align-items:center; gap:10px; padding:10px 12px; border-radius:14px; border:1px solid var(--border);
              background:rgba(255,255,255,0.04); font-size:13px; color:var(--muted); }
-    .dot{ width:10px; height:10px; border-radius:999px; background:rgba(255,255,255,0.35); box-shadow: 0 0 0 4px rgba(255,255,255,0.06); }
-    .dot.ok{ background:rgba(34,197,94,0.9); box-shadow: 0 0 0 4px rgba(34,197,94,0.15); }
-    .dot.bad{ background:rgba(239,68,68,0.9); box-shadow: 0 0 0 4px rgba(239,68,68,0.15); }
-    a.link{ color:rgba(255,255,255,0.9); text-decoration:none; border-bottom:1px dashed rgba(255,255,255,0.35); }
-    a.link:hover{ border-bottom-color: rgba(255,255,255,0.7); }
-    .foot{ margin-top:16px; color:var(--muted2); font-size:12px; }
+    .dot{ width:10px; height:10px; border-radius:999px; background:rgba(255,255,255,0.35); }
+    .dot.ok{ background:rgba(34,197,94,0.9); }
+    .dot.bad{ background:rgba(239,68,68,0.9); }
   </style>
 </head>
 <body>
@@ -345,25 +362,13 @@ def home():
           </div>
           <div style="height: 12px"></div>
           <pre id="out">Cargando...</pre>
-          <div class="foot">
-            Endpoints: <a class="link" href="/api/latest-report">/api/latest-report</a> ·
-            <a class="link" href="/api/generate">/api/generate</a> ·
-            <a class="link" href="/api/download-report">/api/download-report</a>
-          </div>
         </div>
       </div>
 
       <div class="card">
         <div class="hd"><h2>Notas</h2></div>
         <div class="bd">
-          <p class="muted">
-            El generador: (1) lee RSS de noticias, (2) crea un informe original con IA, (3) lo guarda, (4) lo convierte a PDF.
-          </p>
-          <p class="muted">
-            Configurable con <span style="font-family: var(--mono);">NEWS_QUERY</span> y <span style="font-family: var(--mono);">NEWS_MAX_ITEMS</span>.
-          </p>
-          <div style="height: 10px"></div>
-          <div class="status"><span class="dot ok"></span><span>Scheduler activo: genera a las 08:00 (server time)</span></div>
+          <div class="status"><span class="dot ok"></span><span>Scheduler activo: 08:00 (server time)</span></div>
         </div>
       </div>
     </div>
@@ -396,7 +401,7 @@ def home():
       }
 
       elWeek.textContent = data.week ?? '—';
-      elTs.textContent = data.generated_at ?? (new Date().toISOString().slice(0,19).replace('T',' '));
+      elTs.textContent = data.generated_at ?? '—';
       elOut.textContent = JSON.stringify(data, null, 2);
       setStatus(true, 'Listo ✅');
     }catch(e){
@@ -407,18 +412,22 @@ def home():
 
   async function generate(){
     try{
-      setStatus(true, 'Generando (puede tardar unos segundos)...');
+      setStatus(true, 'Generando (puede tardar)...');
       const r = await fetch('/api/generate', {method: 'POST'});
       const j = await r.json().catch(()=> ({}));
+
+      // MOSTRAR EL ERROR REAL SI FALLA
       if(!r.ok){
         elOut.textContent = JSON.stringify(j, null, 2);
         setStatus(false, 'Error generando');
         return;
       }
-      await loadLatest();
+
+      elOut.textContent = JSON.stringify(j, null, 2);
       setStatus(true, 'Informe generado ✅');
+      await loadLatest();
     }catch(e){
-      setStatus(false, 'Error generando el informe');
+      setStatus(false, 'Error generando');
       elOut.textContent = 'Error llamando /api/generate\\n\\n' + (e?.message || e);
     }
   }
@@ -442,9 +451,6 @@ def home():
 """
 
 
-# ---------------------------
-# API
-# ---------------------------
 @app.route("/api/latest-report")
 def latest():
     if gen.reports:
@@ -456,10 +462,20 @@ def latest():
 @app.route("/api/generate", methods=["POST", "GET"])
 def generate():
     try:
-        gen.generate()
-        return jsonify({"status": "ok"})
+        report = gen.generate()
+        return jsonify(report)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        # Esto te devuelve el error real a la web
+        return (
+            jsonify(
+                {
+                    "error": str(e),
+                    "trace": traceback.format_exc().splitlines()[-12:],
+                    "hint": "Mira si OPENAI_API_KEY está puesta y si OPENAI_MODEL existe en tu cuenta.",
+                }
+            ),
+            500,
+        )
 
 
 def _safe_list(items):
@@ -576,9 +592,6 @@ def download_report():
     )
 
 
-# ---------------------------
-# Scheduler
-# ---------------------------
 def run_scheduler():
     schedule.every().day.at("08:00").do(gen.generate)
     while True:
