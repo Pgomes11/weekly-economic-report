@@ -1,10 +1,17 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, send_file
 from datetime import datetime
 import json
 import os
 import schedule
 import threading
 import time
+from io import BytesIO
+
+# PDF (ReportLab)
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
 
 app = Flask(__name__)
 STORAGE_FILE = "reports.json"
@@ -200,6 +207,7 @@ def home():
       background: rgba(34,197,94,0.16);
       border-color: rgba(34,197,94,0.35);
     }
+    .success:hover{ background: rgba(34,197,94,0.22); }
 
     .muted{
       color: var(--muted);
@@ -288,6 +296,7 @@ def home():
           <div class="btns">
             <button class="primary" id="btnGen">Generar informe</button>
             <button id="btnRefresh">Actualizar</button>
+            <button class="success" id="btnDownload">Descargar PDF</button>
           </div>
         </div>
         <div class="bd">
@@ -299,7 +308,8 @@ def home():
           <pre id="out">Cargando...</pre>
           <div class="foot">
             Endpoints: <a class="link" href="/api/latest-report">/api/latest-report</a> ·
-            <a class="link" href="/api/generate">/api/generate</a>
+            <a class="link" href="/api/generate">/api/generate</a> ·
+            <a class="link" href="/api/download-report">/api/download-report</a>
           </div>
         </div>
       </div>
@@ -361,7 +371,6 @@ def home():
         return;
       }
 
-      // data = {message, week} según tu API actual
       elWeek.textContent = data.week ?? '—';
       elTs.textContent = new Date().toISOString().slice(0,19).replace('T',' ');
       elOut.textContent = JSON.stringify(data, null, 2);
@@ -385,10 +394,14 @@ def home():
     }
   }
 
+  function downloadPdf(){
+    window.location = '/api/download-report';
+  }
+
   document.getElementById('btnGen').addEventListener('click', generate);
   document.getElementById('btnRefresh').addEventListener('click', loadLatest);
+  document.getElementById('btnDownload').addEventListener('click', downloadPdf);
 
-  // fecha arriba
   document.getElementById('now').textContent =
     new Date().toLocaleString('es-ES', { dateStyle: 'full', timeStyle: 'short' });
 
@@ -414,6 +427,91 @@ def generate():
     return jsonify({"status": "ok"})
 
 
+@app.route("/api/download-report")
+def download_report():
+    if not gen.reports:
+        return jsonify({"error": "No reports"}), 404
+
+    last = max(gen.reports.keys())
+    report = gen.reports[last]
+
+    week = report.get("data", {}).get("week", last)
+    timestamp = report.get("timestamp", "")
+    message = report.get("data", {}).get("message", "—")
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=40,
+        rightMargin=40,
+        topMargin=44,
+        bottomMargin=44,
+        title="Weekly Economic Report",
+    )
+
+    styles = getSampleStyleSheet()
+    story = []
+
+    story.append(Paragraph("Weekly Economic Report", styles["Title"]))
+    story.append(Spacer(1, 12))
+    story.append(Paragraph("Informe semanal (auto-generado)", styles["Italic"]))
+    story.append(Spacer(1, 18))
+
+    meta_table = Table(
+        [
+            ["Semana", week],
+            ["Generado", timestamp],
+        ],
+        colWidths=[110, 380],
+    )
+    meta_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (0, -1), colors.whitesmoke),
+                ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
+                ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+                ("FONTSIZE", (0, 0), (-1, -1), 10),
+                ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
+                ("BOX", (0, 0), (-1, -1), 0.25, colors.lightgrey),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ]
+        )
+    )
+
+    story.append(meta_table)
+    story.append(Spacer(1, 18))
+
+    story.append(Paragraph("Contenido", styles["Heading2"]))
+    story.append(Spacer(1, 6))
+    story.append(Paragraph(message, styles["BodyText"]))
+    story.append(Spacer(1, 12))
+
+    story.append(Paragraph("Datos (JSON)", styles["Heading3"]))
+    story.append(Spacer(1, 6))
+    story.append(
+        Paragraph(
+            f"<font face='Courier'>{json.dumps(report.get('data', {}), ensure_ascii=False)}</font>",
+            styles["BodyText"],
+        )
+    )
+
+    doc.build(story)
+    buffer.seek(0)
+
+    filename = f"weekly_report_{week}.pdf".replace(":", "-")
+    return send_file(
+        buffer,
+        as_attachment=True,
+        download_name=filename,
+        mimetype="application/pdf",
+    )
+
+
 def run_scheduler():
     schedule.every().day.at("08:00").do(gen.generate)
     while True:
@@ -428,3 +526,4 @@ t.start()
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
+
