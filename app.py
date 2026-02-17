@@ -6,10 +6,9 @@ import schedule
 import threading
 import time
 from io import BytesIO
+import xml.etree.ElementTree as ET
 
 import requests
-import feedparser
-
 from openai import OpenAI
 
 # PDF (ReportLab)
@@ -30,12 +29,11 @@ from reportlab.lib import colors
 app = Flask(__name__)
 STORAGE_FILE = "reports.json"
 
-# OpenAI client (reads OPENAI_API_KEY from env)
 client = OpenAI()
 
 
 # ---------------------------
-# Config helpers
+# Helpers
 # ---------------------------
 def env_int(name: str, default: int) -> int:
     try:
@@ -49,15 +47,13 @@ def now_week() -> str:
 
 
 def news_query() -> str:
-    # Puedes cambiarlo en Render con NEWS_QUERY
     return os.getenv(
         "NEWS_QUERY",
-        "mercado inmobiliario Madrid precios vivienda Idealista informe",
+        "idealista informe precio vivienda madrid mercado inmobiliario",
     ).strip()
 
 
 def news_language() -> str:
-    # hl: interfaz; ceid: edición, para España
     return os.getenv("NEWS_LANG", "es").strip()
 
 
@@ -70,15 +66,11 @@ def max_news_items() -> int:
 
 
 def openai_model() -> str:
-    # Pon OPENAI_MODEL en Render si quieres cambiarlo
+    # Puedes definir OPENAI_MODEL en Render si quieres
     return os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
 
-# ---------------------------
-# News fetching (RSS)
-# ---------------------------
 def build_google_news_rss_url(query: str, lang: str = "es", country: str = "ES") -> str:
-    # Ejemplo: https://news.google.com/rss/search?q=...&hl=es&gl=ES&ceid=ES:es
     ceid = f"{country}:{lang}"
     return (
         "https://news.google.com/rss/search?q="
@@ -87,40 +79,52 @@ def build_google_news_rss_url(query: str, lang: str = "es", country: str = "ES")
     )
 
 
+def _clean_text(s: str) -> str:
+    if not s:
+        return ""
+    # Limpieza básica de HTML típico del RSS
+    s = s.replace("<b>", "").replace("</b>", "")
+    s = s.replace("<br>", " ").replace("<br/>", " ").replace("<br />", " ")
+    s = " ".join(s.split())
+    return s.strip()
+
+
 def fetch_news_items(query: str, max_items: int = 10, lang: str = "es", country: str = "ES") -> list[dict]:
     """
-    Devuelve una lista de items:
-    [{title, url, published, source, snippet}]
+    Lee Google News RSS (XML) sin dependencias externas.
+    Devuelve: [{title, url, published, source, snippet}]
     """
     rss_url = build_google_news_rss_url(query, lang=lang, country=country)
-    feed = feedparser.parse(rss_url)
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; WeeklyEconomicReport/1.0)"}
+    r = requests.get(rss_url, headers=headers, timeout=20)
+    r.raise_for_status()
+
+    root = ET.fromstring(r.text)
+
+    # RSS estándar: <rss><channel><item>...
+    channel = root.find("channel")
+    if channel is None:
+        return []
 
     items = []
-    for entry in feed.entries[: max_items]:
-        title = getattr(entry, "title", "") or ""
-        url = getattr(entry, "link", "") or ""
-        published = getattr(entry, "published", "") or ""
-        source = ""
-        if hasattr(entry, "source") and isinstance(entry.source, dict):
-            source = entry.source.get("title", "") or ""
+    for item in channel.findall("item")[:max_items]:
+        title = item.findtext("title", default="") or ""
+        link = item.findtext("link", default="") or ""
+        pub_date = item.findtext("pubDate", default="") or ""
 
-        # snippet: Google News RSS suele meter summary/description con HTML
-        snippet = ""
-        if hasattr(entry, "summary"):
-            snippet = entry.summary or ""
-        elif hasattr(entry, "description"):
-            snippet = entry.description or ""
+        # Google News suele meter <source>... en item
+        source_el = item.find("source")
+        source = source_el.text.strip() if (source_el is not None and source_el.text) else ""
 
-        # Limpieza muy simple de tags HTML
-        snippet = snippet.replace("<b>", "").replace("</b>", "")
-        snippet = snippet.replace("<br>", " ").replace("<br/>", " ")
-        snippet = " ".join(snippet.split())
+        # description suele traer snippet con HTML
+        desc = item.findtext("description", default="") or ""
+        snippet = _clean_text(desc)
 
         items.append(
             {
                 "title": title.strip(),
-                "url": url.strip(),
-                "published": published.strip(),
+                "url": link.strip(),
+                "published": pub_date.strip(),
                 "source": source.strip(),
                 "snippet": snippet.strip(),
             }
@@ -129,15 +133,10 @@ def fetch_news_items(query: str, max_items: int = 10, lang: str = "es", country:
     return items
 
 
-# ---------------------------
-# OpenAI report generation
-# ---------------------------
 def build_report_with_openai(news_items: list[dict], week: str) -> dict:
     """
-    Genera un informe original en base a titulares + snippets (no copia artículos).
-    Devuelve JSON estructurado.
+    Informe original basado en titulares+snippets (no copia artículos).
     """
-    # Compact input
     lines = []
     for i, it in enumerate(news_items, start=1):
         lines.append(
@@ -149,15 +148,14 @@ def build_report_with_openai(news_items: list[dict], week: str) -> dict:
         )
     input_text = "\n".join(lines).strip()
 
-    # Nota clave: debe aparecer la palabra "json" para usar text.format json_object
     instructions = (
         "IMPORTANTE: Devuelve SOLO json válido (json). No añadas texto fuera del JSON.\n\n"
         "Eres analista del mercado inmobiliario en España. "
         "Con la lista de noticias (titulares + snippets) redacta un INFORME SEMANAL original, claro y accionable.\n\n"
         "Reglas:\n"
         "- NO copies artículos ni pegues texto largo: usa solo el snippet como señal.\n"
-        "- Si un dato no está en las noticias, di que no aparece.\n"
-        "- Identifica temas recurrentes, señales de precio/ventas/oferta, sentimiento y riesgos.\n"
+        "- Si un dato no aparece, dilo explícitamente; NO inventes.\n"
+        "- Identifica señales sobre: precios, oferta, demanda, financiación/hipotecas, regulación y sentimiento.\n"
         "- Incluye una sección de 'Fuentes' con enlaces (los de las noticias).\n\n"
         "Salida EXACTA en json con esta estructura:\n"
         "{\n"
@@ -173,7 +171,6 @@ def build_report_with_openai(news_items: list[dict], week: str) -> dict:
     resp = client.responses.create(
         model=openai_model(),
         instructions=instructions,
-        # metemos "(json)" también aquí para cumplir el requisito sí o sí
         input=f"(json) Semana objetivo: {week}\n\nNOTICIAS:\n{input_text}",
         text={"format": {"type": "json_object"}},
     )
@@ -205,12 +202,6 @@ class ReportGenerator:
             json.dump(self.reports, f, ensure_ascii=False, indent=2, default=str)
 
     def generate(self):
-        """
-        Pipeline:
-        1) Lee noticias (RSS)
-        2) Resume y estructura el informe con OpenAI
-        3) Guarda en reports.json
-        """
         week = now_week()
 
         items = fetch_news_items(
@@ -221,14 +212,13 @@ class ReportGenerator:
         )
 
         if not items:
-            # Aun así guardamos algo para no romper
             report_struct = {
                 "title": "Weekly Economic Report",
                 "week": week,
-                "executive_summary": ["No se han podido recuperar noticias (RSS vacío o fallo de red)."],
-                "sections": [
-                    {"heading": "Estado del feed", "bullets": ["No hay items disponibles en este momento."]}
+                "executive_summary": [
+                    "No se han podido recuperar noticias (RSS vacío o fallo de red)."
                 ],
+                "sections": [{"heading": "Estado del feed", "bullets": ["No hay items disponibles."]}],
                 "sources": [],
                 "generated_at": datetime.now().isoformat(timespec="seconds"),
             }
@@ -367,10 +357,10 @@ def home():
         <div class="hd"><h2>Notas</h2></div>
         <div class="bd">
           <p class="muted">
-            El generador: (1) lee titulares+snippets vía RSS, (2) crea un informe original con IA, (3) lo guarda, (4) lo convierte a PDF.
+            El generador: (1) lee RSS de noticias, (2) crea un informe original con IA, (3) lo guarda, (4) lo convierte a PDF.
           </p>
           <p class="muted">
-            Configurable en Render con <span style="font-family: var(--mono);">NEWS_QUERY</span> y <span style="font-family: var(--mono);">NEWS_MAX_ITEMS</span>.
+            Configurable con <span style="font-family: var(--mono);">NEWS_QUERY</span> y <span style="font-family: var(--mono);">NEWS_MAX_ITEMS</span>.
           </p>
           <div style="height: 10px"></div>
           <div class="status"><span class="dot ok"></span><span>Scheduler activo: genera a las 08:00 (server time)</span></div>
